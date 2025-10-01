@@ -89,7 +89,7 @@ class LSRouter(Router):
         # on the shortest path to this destination from this router.
     
         dist = {router_id: float('inf') for router_id in self.lsa_dict}
-        prev = {router_id: None for router_id in self.lsa_dict}
+        prev = {router_id: -1 for router_id in self.lsa_dict}
         dist[self.router_id] = 0
         visited = set()
 
@@ -106,15 +106,15 @@ class LSRouter(Router):
                         dist[neighbor] = alt
                         prev[neighbor] = current
 
-        # Populate the forwarding table
-        for router_id in self.lsa_dict:
-            self.fwd_table[router_id] = self.next_hop(router_id, prev)
+        # Populate forwarding table
+        for router_dest in self.lsa_dict:
+            self.fwd_table[router_dest] = self.next_hop(router_dest, prev)
 
     # Recursive function for computing next hops using the prev dictionary
     def next_hop(self, dst, prev):
         # Return None when it is unable to find next_hop 
         #   if dst is disconnected from self.router_id
-        #   Nor if dst and self.router_id are the same
+        #   or if dst and self.router_id are the same
         if prev[dst] == -1 or self.router_id == dst:
             return None
         if prev[dst] == self.router_id:
