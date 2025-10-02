@@ -127,3 +127,5 @@ if __name__ == "__main__":
     adj_mat = tmp.adj_mat()
     print(".graph output\n", tmp)
     print(" adjacency matrix \n", adj_mat)
+
+# test
