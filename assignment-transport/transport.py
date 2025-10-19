@@ -84,8 +84,11 @@ class Receiver:
         TCP handles this.
 
         '''
-
         # TODO
+        if self.rcv_buffer:
+            print("RCV Buffer NOT Empty when finish() was called!")
+        else:
+            print("RCV Buffer Empty when finish() was called")
         pass
 
 
