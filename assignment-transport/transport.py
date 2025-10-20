@@ -17,6 +17,7 @@ packet_size = 1500
 class Receiver:
     def __init__(self):
         # TODO: Initialize any variables you want here, like the receive buffer
+        self.received_ranges = []
         self.rcv_buffer = {} # seq_num_start -> ending seq_num, data
         self.next_seq = 0
 
@@ -48,19 +49,15 @@ class Receiver:
 
         '''
         # TODO
-        ranges_to_ack = []
+        self.received_ranges = self.merge_range(self.received_ranges, seq_range)
         data_for_app = ""
         if seq_range[0] == self.next_seq:
-            ranges_to_ack.append(seq_range)
             data_for_app += data
-
             self.next_seq = seq_range[1]
-            # loop through rcv_buffer to find contiguous ranges that can be ACKed
+            
+            # loop through rcv_buffer to find contiguous ranges that can be delivered
             while self.next_seq in self.rcv_buffer:
                 next_packet = self.rcv_buffer[self.next_seq]
-                packet_range = (self.next_seq, next_packet[0])
-
-                ranges_to_ack.append(packet_range)
                 data_for_app += next_packet[1]
 
                 # remove packet from rcv_buffer b/c gets sent to app right after
@@ -71,9 +68,32 @@ class Receiver:
         else:
             # when we have a gap and can't send anything
             self.rcv_buffer[seq_range[0]] = (seq_range[1], data)
-            # Still need to ACK the out-of-order packet
-            ranges_to_ack.append(seq_range)
-        return (ranges_to_ack, data_for_app)
+        return (self.received_ranges, data_for_app)
+
+    def merge_range(self, existing_ranges, new_range):
+        '''
+        Helper to merge a new range into the list of all existing ranges
+        that the receiver has received.
+        '''
+        new_start, new_end = new_range
+        merged = []
+        i = 0
+        # add all existing_ranges that end before [new_start,new_end)
+        while i < len(existing_ranges) and existing_ranges[i][1] < new_start:
+            merged.append(existing_ranges[i])
+            i += 1
+        # merge overlaps with [new_start,new_end)
+        merged_start, merged_end = new_start, new_end
+        while i < len(existing_ranges) and existing_ranges[i][0] <= merged_end:
+            merged_start = min(merged_start, existing_ranges[i][0])
+            merged_end = max(merged_end, existing_ranges[i][1])
+            i += 1
+        merged.append((merged_start, merged_end))
+        # append the rest
+        while i < len(existing_ranges):
+            merged.append(existing_ranges[i])
+            i += 1
+        return merged
 
     def finish(self):
         '''Called when the sender sends the `fin` packet. You don't need to do
@@ -89,40 +109,28 @@ class Receiver:
         # TODO
         if self.rcv_buffer:
             print("RCV Buffer NOT Empty when finish() was called!")
+            print("Buffer contents:", list(self.rcv_buffer.keys()))
         else:
             print("RCV Buffer Empty when finish() was called")
-        pass
 
 
 class Sender:
     def __init__(self, data_len: int):
         '''`data_len` is the length of the data we want to send. A real
         solution will not force the application to pre-commit to the
-        length of data, but we are ok with it.
-
-        '''
-        # Initialize sender state
+        length of data, but we are ok with it.'''
         self.data_len = data_len
-        # next byte index to allocate for a new packet
         self.next_seq = 0
-        # Map of packet_id -> (start, end) for packets that have been sent
-        # but not yet acknowledged
-        self.sent_packets = {}
-        # List of acknowledged, non-overlapping intervals (start, end)
+        self.sent_packets = {} # Map of packet_id -> (start, end) for sent packets that have been sent but not yet acknowledged
         self.acked_intervals = []
-        # Whether we have observed that all bytes are acked
-        self.finished = False
 
     def timeout(self):
         '''Called when the sender times out.'''
         # On timeout we assume in-flight packets may have been lost.
-        # Clear sent_packets so bytes will be re-allocated for sending
-        # starting from the first unacked byte.
+        # Clear sent_packets so bytes will be re-allocated for sending starting from the first unacked byte.
         self.sent_packets = {}
         if not self._is_all_acked():
             self.next_seq = self._first_unacked()
-        else:
-            self.finished = True
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -134,7 +142,6 @@ class Sender:
         ACKed and another 500-byte is assumed lost, we will return
         600, even if 1000s of bytes have been ACKed before this.'''
         newly_acked = 0
-        # Process each SACKed interval
         for s in sacks:
             start, end = s
             if start >= end:
@@ -146,17 +153,9 @@ class Sender:
                 self._insert_acked(r)
 
         # Remove any sent_packets that are fully ACKed
-        to_delete = []
         for pid, rng in list(self.sent_packets.items()):
             if self._range_fully_acked(rng):
-                to_delete.append(pid)
-
-        for pid in to_delete:
-            del self.sent_packets[pid]
-
-        # If everything is acked, mark finished
-        if self._is_all_acked():
-            self.finished = True
+                del self.sent_packets[pid]
 
         return newly_acked
 
@@ -187,17 +186,14 @@ class Sender:
         start = self.next_seq
         end = min(self.data_len, start + payload_size)
 
-        # Record that this packet_id carries this sequence range
         self.sent_packets[packet_id] = (start, end)
-
-        # Advance next_seq for the next allocation
         self.next_seq = end
 
         return (start, end)
 
-    # --- Helper methods for interval bookkeeping ---
+    # --- Interval helper methods ---
     def _insert_acked(self, interval: Tuple[int, int]) -> None:
-        # Insert and merge into acked_intervals (keeps list sorted, non-overlapping)
+        # Insert and merge into acked_intervals to keep list sorted and non-overlapping
         start, end = interval
         if start >= end:
             return
@@ -252,8 +248,6 @@ class Sender:
             if a > cur:
                 return False
             cur = max(cur, b)
-            if cur >= end:
-                return True
         return cur >= end
 
     def _byte_acked(self, b: int) -> bool:
@@ -265,7 +259,7 @@ class Sender:
         return False
 
     def _first_unacked(self) -> int:
-        # Find the first byte index that is not acked (0..data_len)
+        # Find the first byte index that is not acked (0...data_len) (find first gap)
         cur = 0
         for a, b in self.acked_intervals:
             if cur < a:
@@ -274,6 +268,9 @@ class Sender:
         return min(cur, self.data_len)
 
     def _is_all_acked(self) -> bool:
+        # len(self.acked_intervals) == 1 means there is only one continuous interval
+        # self.acked_intervals[0][0] == 0 means it starts from byte 0
+        # self.acked_intervals[0][1] >= self.data_len means it covers all bytes
         return len(self.acked_intervals) == 1 and self.acked_intervals[0][0] == 0 and self.acked_intervals[0][1] >= self.data_len
 
 
