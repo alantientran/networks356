@@ -1,6 +1,6 @@
 import argparse
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import random
 import socket
 
@@ -71,6 +71,8 @@ class Receiver:
         else:
             # when we have a gap and can't send anything
             self.rcv_buffer[seq_range[0]] = (seq_range[1], data)
+            # Still need to ACK the out-of-order packet
+            ranges_to_ack.append(seq_range)
         return (ranges_to_ack, data_for_app)
 
     def finish(self):
@@ -99,20 +101,28 @@ class Sender:
         length of data, but we are ok with it.
 
         '''
-        # TODO: Initialize any variables you want here, for instance a
-        # data structure to keep track of which packets have been
-        # sent, acknowledged, detected to be lost or retransmitted
+        # Initialize sender state
         self.data_len = data_len
-        self.acked = {} # seq_num_start -> ending seq_num
-        self.sent = {} # packet_id -> (seq_num_start, ending seq_num)
+        # next byte index to allocate for a new packet
+        self.next_seq = 0
+        # Map of packet_id -> (start, end) for packets that have been sent
+        # but not yet acknowledged
+        self.sent_packets = {}
+        # List of acknowledged, non-overlapping intervals (start, end)
+        self.acked_intervals = []
+        # Whether we have observed that all bytes are acked
+        self.finished = False
 
     def timeout(self):
         '''Called when the sender times out.'''
-        # Mark all unacknowledged packets as lost and ready for retransmission
-        for packet_id, seq_range in self.sent.items():
-            if seq_range[0] not in self.acked:
-                # Mark this packet for retransmission
-                del self.sent[packet_id]
+        # On timeout we assume in-flight packets may have been lost.
+        # Clear sent_packets so bytes will be re-allocated for sending
+        # starting from the first unacked byte.
+        self.sent_packets = {}
+        if not self._is_all_acked():
+            self.next_seq = self._first_unacked()
+        else:
+            self.finished = True
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -122,12 +132,31 @@ class Sender:
         has been assumed to be lost because of dupACKs. Note, this
         number is incremental. For example, if one 100-byte packet is
         ACKed and another 500-byte is assumed lost, we will return
-        600, even if 1000s of bytes have been ACKed before this.
+        600, even if 1000s of bytes have been ACKed before this.'''
+        newly_acked = 0
+        # Process each SACKed interval
+        for s in sacks:
+            start, end = s
+            if start >= end:
+                continue
+            # Compute bytes in [start,end) that are not yet acked
+            remaining = self._subtract_acked((start, end))
+            for r in remaining:
+                newly_acked += r[1] - r[0]
+                self._insert_acked(r)
 
-        '''
-        seq_range = self.sent[packet_id]
-        self.acked[seq_range[0]] = seq_range[1]
-        newly_acked = seq_range[1] - seq_range[0]
+        # Remove any sent_packets that are fully ACKed
+        to_delete = []
+        for pid, rng in list(self.sent_packets.items()):
+            if self._range_fully_acked(rng):
+                to_delete.append(pid)
+
+        for pid in to_delete:
+            del self.sent_packets[pid]
+
+        # If everything is acked, mark finished
+        if self._is_all_acked():
+            self.finished = True
 
         return newly_acked
 
@@ -140,20 +169,112 @@ class Sender:
         acknowledged. Note: The range should not be larger than
         `payload_size` or contain any bytes that have already been
         acknowledged
-
         '''
-        if packet_id in self.sent:
-            # packet already sent but maybe dropped so retransmit
-            return self.sent[packet_id]
-        # send new packets
-        start_seq = packet_id * payload_size
-        if start_seq < self.data_len:
-            end_seq = min(start_seq + payload_size, self.data_len)
-            self.sent[packet_id] = (start_seq, end_seq)
-            return (start_seq, end_seq)
-        # all packets sent
-        return (0, 0)
+        # If everything has been acknowledged, return None to indicate we're done
+        if self._is_all_acked():
+            return None
 
+        # Advance next_seq past any already-acked bytes
+        if self.next_seq < self.data_len and self._byte_acked(self.next_seq):
+            self.next_seq = self._first_unacked()
+
+        # If there are no bytes currently available to send (all allocated
+        # but not yet acked), return a zero-range to indicate caller should
+        # wait for ACKs or timeout.
+        if self.next_seq >= self.data_len:
+            return (0, 0)
+
+        start = self.next_seq
+        end = min(self.data_len, start + payload_size)
+
+        # Record that this packet_id carries this sequence range
+        self.sent_packets[packet_id] = (start, end)
+
+        # Advance next_seq for the next allocation
+        self.next_seq = end
+
+        return (start, end)
+
+    # --- Helper methods for interval bookkeeping ---
+    def _insert_acked(self, interval: Tuple[int, int]) -> None:
+        # Insert and merge into acked_intervals (keeps list sorted, non-overlapping)
+        start, end = interval
+        if start >= end:
+            return
+        new = []
+        placed = False
+        for a, b in self.acked_intervals:
+            if b < start:
+                new.append((a, b))
+            elif end < a:
+                if not placed:
+                    new.append((start, end))
+                    placed = True
+                new.append((a, b))
+            else:
+                # Overlaps, merge
+                start = min(start, a)
+                end = max(end, b)
+        if not placed:
+            new.append((start, end))
+        # sort just in case and assign
+        new.sort()
+        self.acked_intervals = new
+
+    def _subtract_acked(self, interval: Tuple[int, int]) -> List[Tuple[int, int]]:
+        # Return list of sub-intervals of `interval` that are not already acked
+        start, end = interval
+        if start >= end:
+            return []
+        remaining = []
+        cur = start
+        for a, b in self.acked_intervals:
+            if b <= cur:
+                continue
+            if a >= end:
+                break
+            if a > cur:
+                remaining.append((cur, min(a, end)))
+            cur = max(cur, b)
+            if cur >= end:
+                break
+        if cur < end:
+            remaining.append((cur, end))
+        return remaining
+
+    def _range_fully_acked(self, interval: Tuple[int, int]) -> bool:
+        start, end = interval
+        # Check if [start,end) is fully covered by acked_intervals
+        cur = start
+        for a, b in self.acked_intervals:
+            if b <= cur:
+                continue
+            if a > cur:
+                return False
+            cur = max(cur, b)
+            if cur >= end:
+                return True
+        return cur >= end
+
+    def _byte_acked(self, b: int) -> bool:
+        for a, c in self.acked_intervals:
+            if a <= b < c:
+                return True
+            if a > b:
+                return False
+        return False
+
+    def _first_unacked(self) -> int:
+        # Find the first byte index that is not acked (0..data_len)
+        cur = 0
+        for a, b in self.acked_intervals:
+            if cur < a:
+                return cur
+            cur = max(cur, b)
+        return min(cur, self.data_len)
+
+    def _is_all_acked(self) -> bool:
+        return len(self.acked_intervals) == 1 and self.acked_intervals[0][0] == 0 and self.acked_intervals[0][1] >= self.data_len
 
 
 def start_receiver(ip: str, port: int):
@@ -196,7 +317,7 @@ def start_receiver(ip: str, port: int):
 
         while True:
             print("======= Waiting =======")
-            data, addr = server_socket.recvfrom(packet_size)
+            data, addr = server_socket.recvfrom(65535)
             if addr not in receivers:
                 outfile = None  # open(f'rcvd-{addr[0]}-{addr[1]}', 'w')
                 receivers[addr] = (Receiver(), outfile)
@@ -279,7 +400,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     client_socket.send('{"type": "fin"}'.encode())
                     try:
                         print("======= Final Waiting =======")
-                        received = client_socket.recv(packet_size)
+                        received = client_socket.recv(65535)
                         received = json.loads(received.decode())
                         if received["type"] == "ack":
                             client_socket.send('{"type": "fin"}'.encode())
@@ -334,7 +455,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 # Wait for ACKs
                 try:
                     print("======= Waiting =======")
-                    received = client_socket.recv(packet_size)
+                    received = client_socket.recv(65535)
                     received = json.loads(received.decode())
                     assert received["type"] == "ack"
 
