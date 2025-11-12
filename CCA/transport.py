@@ -3,6 +3,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 import random
 import socket
+import time
 
 # Note: In this starter code, we annotate types where
 # appropriate. While it is optional, both in python and for this
@@ -123,6 +124,16 @@ class Sender:
         self.next_seq = 0
         self.sent_packets = {} # Map of packet_id -> (start, end) for sent packets that have been sent but not yet acknowledged
         self.acked_intervals = []
+        # Per-packet send timestamps (packet_id -> last send time in seconds)
+        self.sent_times = {}
+        # RTT estimation (EWMA). None until first measurement.
+        self.rtt_avg = None
+        self.rtt_var = None
+        # EWMA alpha/beta values (RFC-style defaults)
+        self.rtt_alpha = 1.0 / 8.0
+        self.rtt_beta = 1.0 / 4.0
+        # Congestion window constant (bytes) for initial experiments. Default: one packet
+        self._cwnd_bytes = packet_size
 
     def timeout(self):
         '''Called when the sender times out.'''
@@ -142,6 +153,24 @@ class Sender:
         ACKed and another 500-byte is assumed lost, we will return
         600, even if 1000s of bytes have been ACKed before this.'''
         newly_acked = 0
+        # If we have a send timestamp for this packet id, use it to update RTT estimates
+        send_ts = None
+        if packet_id in self.sent_times:
+            send_ts = self.sent_times.pop(packet_id)
+        if send_ts is not None:
+            now = time.time()
+            measured_rtt = now - send_ts
+            if measured_rtt < 0:
+                measured_rtt = 0.0
+            # Initialize EWMA on first measurement
+            if self.rtt_avg is None:
+                self.rtt_avg = measured_rtt
+                # initialize variance to a reasonable value (half the RTT)
+                self.rtt_var = measured_rtt / 2.0
+            else:
+                rtt_diff = abs(measured_rtt - self.rtt_avg)
+                self.rtt_var = (1.0 - self.rtt_beta) * self.rtt_var + self.rtt_beta * rtt_diff
+                self.rtt_avg = (1.0 - self.rtt_alpha) * self.rtt_avg + self.rtt_alpha * measured_rtt
         for s in sacks:
             start, end = s
             if start >= end:
@@ -191,11 +220,21 @@ class Sender:
 
         return (start, end)
 
+    def record_send_time(self, packet_id: int) -> None:
+        """Record timestamp when a packet (by id) was actually transmitted on the socket."""
+        self.sent_times[packet_id] = time.time()
+
     def get_cwnd(self) -> int:
-        return packet_size
+        # For the first step we return a constant congestion window in bytes.
+        return self._cwnd_bytes
     
     def get_rto(self) -> float:
-        return 1.
+        # Conservative default until we have measured RTTs
+        if self.rtt_avg is None or self.rtt_var is None:
+            return 1.0
+        rto = self.rtt_avg + 4.0 * self.rtt_var
+        # enforce a small lower bound
+        return max(0.01, rto)
 
     # --- Interval helper methods ---
     def _insert_acked(self, interval: Tuple[int, int]) -> None:
@@ -315,7 +354,7 @@ def start_receiver(ip: str, port: int):
     receivers: Dict[str, Receiver] = {}
     # p3 code
     # receivers: Dict[str, Tuple[Receiver, Any]] = {}
-    # received_data = ''
+    received_data = ''
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((ip, port))
 
@@ -393,6 +432,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         send_buf = [] # p3 code
 
         while True:
+            # Ask sender for current congestion window (bytes)
+            cwnd = sender.get_cwnd()
             # Do we have enough room in recv_window to send an entire
             # packet?
             if inflight + packet_size <= min(recv_window, cwnd) and not wait:
@@ -450,6 +491,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                             {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
                         ).encode()
                     )
+                    # record the actual send time for RTT measurement
+                    sender.record_send_time(packet_id)
                     # our P3 code
                     # pkt_str = json.dumps(
                     #     {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
@@ -513,7 +556,7 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
-            start_sender(args.ip, args.port, data, args.recv_window, args.simloss, args.simloss)
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss)
 
 
 if __name__ == "__main__":
