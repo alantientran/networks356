@@ -132,14 +132,20 @@ class Sender:
         # EWMA alpha/beta values (RFC-style defaults)
         self.rtt_alpha = 1.0 / 8.0
         self.rtt_beta = 1.0 / 4.0
-        # Congestion window constant (bytes) for initial experiments. Default: one packet
-        self._cwnd_bytes = packet_size
+        # Congestion window (bytes) for AIMD. Start with 1 packet (slow-start would also start low).
+        # Keep as float for fractional additive increments; get_cwnd() will return an int.
+        self.cwnd = float(payload_size)
 
     def timeout(self):
         '''Called when the sender times out.'''
         # On timeout we assume in-flight packets may have been lost.
         # Clear sent_packets so bytes will be re-allocated for sending starting from the first unacked byte.
         self.sent_packets = {}
+        # Multiplicative decrease on timeout/loss: halve the congestion window (min 1 packet)
+        try:
+            self.cwnd = max(float(payload_size), self.cwnd / 2.0)
+        except Exception:
+            self.cwnd = float(payload_size)
         if not self._is_all_acked():
             self.next_seq = self._first_unacked()
 
@@ -186,6 +192,19 @@ class Sender:
             if self._range_fully_acked(rng):
                 del self.sent_packets[pid]
 
+        # Additive increase: increase cwnd by ~1 packet per RTT.
+        # We implement per-ACK fractional increments so that across an RTT
+        # the total increase is approximately `payload_size` bytes.
+        if newly_acked > 0:
+            try:
+                # fraction of cwnd freed by this ACKs
+                frac = float(newly_acked) / max(self.cwnd, 1.0)
+                inc = payload_size * frac
+                self.cwnd += inc
+            except Exception:
+                # keep cwnd sane on unexpected errors
+                self.cwnd = max(float(payload_size), getattr(self, 'cwnd', float(payload_size)))
+
         return newly_acked
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
@@ -225,8 +244,8 @@ class Sender:
         self.sent_times[packet_id] = time.time()
 
     def get_cwnd(self) -> int:
-        # For the first step we return a constant congestion window in bytes.
-        return self._cwnd_bytes
+        # Return current congestion window in bytes (int).
+        return int(max(payload_size, int(self.cwnd)))
     
     def get_rto(self) -> float:
         # Conservative default until we have measured RTTs
@@ -435,8 +454,9 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
             # Ask sender for current congestion window (bytes)
             cwnd = sender.get_cwnd()
             # Do we have enough room in recv_window to send an entire
-            # packet?
-            if inflight + packet_size <= min(recv_window, cwnd) and not wait:
+            # packet? Use payload_size (bytes of data) for inflight accounting
+            # since `inflight` counts payload bytes.
+            if inflight + payload_size <= min(recv_window, cwnd) and not wait:
                 seq = sender.send(packet_id)
                 got_fin_ack = False
                 if seq is None:
