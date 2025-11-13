@@ -3,6 +3,7 @@
 This README explains how the receiver stores throughput logs and how to visualize them with `mm-throughput-graph`.
 
 What I changed
+
 - The receiver (`CCA/transport.py`) now appends timestamped cumulative bytes to `mm_throughput.log` in the current working directory.
 - Each line in `mm_throughput.log` has the format:
 
@@ -12,6 +13,7 @@ What I changed
   1600000000.123456 1024
 
 How to run (CloudLab / two nodes)
+
 1. On the receiver node, run:
 
 ```zsh
@@ -43,5 +45,6 @@ mm-throughput-graph mm_throughput_samples.txt
 If `mm-throughput-graph` expects a different column order or units, the helper script can be adapted.
 
 Notes and next steps
+
 - I only added receiver-side logging (cumulative bytes). If you'd like sender-side cwnd/rtt logging, I can add that too.
 - If you have an expected input format for `mm-throughput-graph`, tell me and I'll adapt the converter to match it exactly.

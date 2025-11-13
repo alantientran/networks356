@@ -107,11 +107,7 @@ class Receiver:
         TCP handles this.
 
         '''
-        if self.rcv_buffer:
-            print("RCV Buffer NOT Empty when finish() was called!")
-            print("Buffer contents:", list(self.rcv_buffer.keys()))
-        else:
-            print("RCV Buffer Empty when finish() was called")
+        print("Finished")
 
 
 class Sender:
@@ -514,11 +510,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         continue
 
 
-                    sender.ack_packet(received["sacks"], received["id"])
-                    try:
-                        inflight = sum((end - start) for (start, end) in sender.sent_packets.values())
-                    except Exception:
-                        inflight = max(0, inflight)
+                    inflight = max(0, inflight - sender.ack_packet(received["sacks"], received["id"]))
+                    assert inflight >= 0
                 except socket.timeout:
                     inflight = 0
                     print("Timeout")
