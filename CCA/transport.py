@@ -107,7 +107,6 @@ class Receiver:
         TCP handles this.
 
         '''
-        # TODO
         if self.rcv_buffer:
             print("RCV Buffer NOT Empty when finish() was called!")
             print("Buffer contents:", list(self.rcv_buffer.keys()))
@@ -122,26 +121,23 @@ class Sender:
         length of data, but we are ok with it.'''
         self.data_len = data_len
         self.next_seq = 0
-        self.sent_packets = {} # Map of packet_id -> (start, end) for sent packets that have been sent but not yet acknowledged
+        self.sent_packets = {} # packet_id -> (start, end) for sent packets that have not yet been acknowledged
         self.acked_intervals = []
-        # Per-packet send timestamps (packet_id -> last send time in seconds)
-        self.sent_times = {}
+        self.sent_times = {} # packet_id -> last send time in seconds
         # RTT estimation (EWMA). None until first measurement.
         self.rtt_avg = None
         self.rtt_var = None
         # EWMA alpha/beta values (RFC-style defaults)
         self.rtt_alpha = 1.0 / 8.0
         self.rtt_beta = 1.0 / 4.0
-        # Congestion window (bytes) for AIMD. Start with 1 packet (slow-start would also start low).
-        # Keep as float for fractional additive increments; get_cwnd() will return an int.
-        self.cwnd = float(payload_size)
+        self.cwnd = float(payload_size) # Keep as float for fractional additive increments
 
     def timeout(self):
         '''Called when the sender times out.'''
         # On timeout we assume in-flight packets may have been lost.
         # Clear sent_packets so bytes will be re-allocated for sending starting from the first unacked byte.
         self.sent_packets = {}
-        # Multiplicative decrease on timeout/loss: halve the congestion window (min 1 packet)
+        # Multiplicative decrease (half) on timeout/loss
         try:
             self.cwnd = max(float(payload_size), self.cwnd / 2.0)
         except Exception:
@@ -192,7 +188,7 @@ class Sender:
             if self._range_fully_acked(rng):
                 del self.sent_packets[pid]
 
-        # Additive increase: increase cwnd by ~1 packet per RTT.
+        # Additive increase: increase cwnd by 1 packet per RTT.
         # We implement per-ACK fractional increments so that across an RTT
         # the total increase is approximately `payload_size` bytes.
         if newly_acked > 0:
@@ -202,7 +198,7 @@ class Sender:
                 inc = payload_size * frac
                 self.cwnd += inc
             except Exception:
-                # keep cwnd sane on unexpected errors
+                # keep cwnd same on unexpected errors
                 self.cwnd = max(float(payload_size), getattr(self, 'cwnd', float(payload_size)))
 
         return newly_acked
@@ -255,7 +251,7 @@ class Sender:
         # enforce a small lower bound
         return max(0.01, rto)
 
-    # --- Interval helper methods ---
+    # Interval helper methods 
     def _insert_acked(self, interval: Tuple[int, int]) -> None:
         # Insert and merge into acked_intervals to keep list sorted and non-overlapping
         start, end = interval
@@ -371,20 +367,19 @@ def start_receiver(ip: str, port: int):
 
     '''
     receivers: Dict[str, Receiver] = {}
-    # p3 code
-    # receivers: Dict[str, Tuple[Receiver, Any]] = {}
     received_data = ''
+    # Log file used by mm-throughput-graph: each line contains
+    # <unix_time_seconds> <cumulative_bytes_received>
+    log_path = 'mm_throughput.log'
+    cumulative_bytes = 0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((ip, port))
+        log_file = open(log_path, 'a')
 
         while True:
             data, addr = server_socket.recvfrom(packet_size)
-            # data, addr = server_socket.recvfrom(65535) # p3 code
             if addr not in receivers:
                 receivers[addr] = Receiver()
-                # p3 code
-                # outfile = None  # open(f'rcvd-{addr[0]}-{addr[1]}', 'w')
-                # receivers[addr] = (Receiver(), outfile)
 
             received = json.loads(data.decode())
             if received["type"] == "data":
@@ -406,30 +401,41 @@ def start_receiver(ip: str, port: int):
                 # a byte structure given the data structure. However,
                 # for an internet standard, we usually want something
                 # more custom and hand-designed.
-                # sacks, app_data = receivers[addr][0].data_packet(tuple(received["seq"]), received["payload"]) # P3 Code
                 sacks, app_data = receivers[addr].data_packet(tuple(received["seq"]), received["payload"])
                 # Note: we immediately write the data to file
                 # receivers[addr][1].write(app_data)
                 print(f"Received seq: {received['seq']}, id: {received['id']}, sending sacks: {sacks}")
                 received_data += app_data # p3
+                # Update cumulative bytes and write a timestamped sample for plotting
+                if app_data:
+                    try:
+                        # app_data is a str of printable ASCII per assignment notes
+                        cumulative_bytes += len(app_data)
+                        log_file.write(f"{time.time():.6f} {cumulative_bytes}\n")
+                        log_file.flush()
+                    except Exception:
+                        # If logging fails, continue without crashing the receiver
+                        pass
 
                 # Send the ACK
                 server_socket.sendto(json.dumps({"type": "ack", "sacks": sacks, "id": received["id"]}).encode(), addr)
             elif received["type"] == "fin":
                 receivers[addr].finish()
-                # P3 code
-                # receivers[addr][0].finish()
-                # # Check if the file is received and send fin-ack
-                # if received_data:
-                #     print("received data (summary): ", received_data[:100], "...", len(received_data))
-                #     # print("received file is saved into: ", receivers[addr][1].name)
-                #     server_socket.sendto(json.dumps({"type": "fin"}).encode(), addr)
-                #     received_data = ''
 
-                # del receivers[addr]
-
+                try:
+                    # attempt to close but guard in case already closed
+                    if not log_file.closed:
+                        log_file.close()
+                except Exception:
+                    pass
             else:
                 assert False
+        # Ensure log file is closed on normal exit as well
+        try:
+            if not log_file.closed:
+                log_file.close()
+        except Exception:
+            pass
 
 
 def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float):
@@ -438,9 +444,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
         # So we can receive messages
         client_socket.connect((ip, port))
-        # When waiting for packets when we call receivefrom, we
-        # shouldn't wait more than 500ms
-        # client_socket.settimeout(0.5) # p3 code
 
         # Number of bytes that we think are inflight. We are only
         # including payload bytes here, which is different from how
@@ -469,27 +472,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         send_buf = []
                     client_socket.send('{"type": "fin"}'.encode())
                     break
-                    # p3 code
-                    # try:
-                    #     print("======= Final Waiting =======")
-                    #     received = client_socket.recv(65535)
-                    #     received = json.loads(received.decode())
-                    #     if received["type"] == "ack":
-                    #         client_socket.send('{"type": "fin"}'.encode())
-                    #         continue
-                    #     elif received["type"] == "fin":
-                    #         print(f"Got FIN-ACK")
-                    #         got_fin_ack = True
-                    #         break
-                    # except socket.timeout:
-                    #     inflight = 0
-                    #     print("Timeout")
-                    #     sender.timeout()
-                    #     exit(1)
-                    # if got_fin_ack:
-                    #     break
-                    # else:
-                    #     continue
 
                 elif seq[1] == seq[0]:
                     # No more packets to send until loss happens. Wait
@@ -502,7 +484,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
 
                 # Simulate random loss before sending packets
                 if random.random() < simloss:
-                    # print("Dropped!") # from P3 code
                     pass
                 else:
                     # Send the packet
@@ -513,21 +494,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     )
                     # record the actual send time for RTT measurement
                     sender.record_send_time(packet_id)
-                    # our P3 code
-                    # pkt_str = json.dumps(
-                    #     {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
-                    # ).encode()
-                    # # pkts_to_reorder is a variable that bounds the maximum amount of reordering. To disable reordering, set to 1
-                    # if len(send_buf) < pkts_to_reorder:
-                    #     send_buf += [pkt_str]
-
-                    # if len(send_buf) == pkts_to_reorder:
-                    #     # Randomly shuffle send_buf
-                    #     random.shuffle(send_buf)
-
-                    #     for p in send_buf:
-                    #         client_socket.send(p)
-                    #     send_buf = []
 
                 inflight += seq[1] - seq[0]
                 packet_id += 1
@@ -547,8 +513,12 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         print("Dropped ack!")
                         continue
 
-                    inflight -= sender.ack_packet(received["sacks"], received["id"])
-                    assert inflight >= 0
+                    sender.ack_packet(received["sacks"], received["id"])
+                    # simloss negative inflight patch
+                    try:
+                        inflight = sum((end - start) for (start, end) in sender.sent_packets.values())
+                    except Exception:
+                        inflight = max(0, inflight)
                 except socket.timeout:
                     inflight = 0
                     print("Timeout")
