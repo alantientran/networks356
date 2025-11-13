@@ -513,8 +513,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         print("Dropped ack!")
                         continue
 
+
                     sender.ack_packet(received["sacks"], received["id"])
-                    # simloss negative inflight patch
                     try:
                         inflight = sum((end - start) for (start, end) in sender.sent_packets.values())
                     except Exception:
