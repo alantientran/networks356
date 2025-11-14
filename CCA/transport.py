@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import random
 import socket
 import time
+import os
 
 # Note: In this starter code, we annotate types where
 # appropriate. While it is optional, both in python and for this
@@ -13,6 +14,9 @@ import time
 payload_size = 1200
 # The maximum size of a packet including all the JSON formatting
 packet_size = 1500
+
+# Optional fixed cwnd in units of PACKETS (if set, overrides AIMD)
+FIXED_CWND_PACKETS: Optional[float] = None
 
 
 class Receiver:
@@ -237,6 +241,16 @@ class Sender:
 
     def get_cwnd(self) -> int:
         # Return current congestion window in bytes (int).
+        # If a fixed cwnd (in PACKETS) is set at module level, use it.
+        # This allows external sweep scripts to evaluate constant cwnd values
+        # without implementing a full CCA.
+        global FIXED_CWND_PACKETS
+        try:
+            if FIXED_CWND_PACKETS is not None:
+                # allow fractional packet counts, but return bytes
+                return int(max(payload_size, int(FIXED_CWND_PACKETS * payload_size)))
+        except Exception:
+            pass
         return int(max(payload_size, int(self.cwnd)))
     
     def get_rto(self) -> float:
@@ -366,7 +380,9 @@ def start_receiver(ip: str, port: int):
     received_data = ''
     # Log file used by mm-throughput-graph: each line contains
     # <unix_time_seconds> <cumulative_bytes_received>
-    log_path = 'mm_throughput.log'
+    # Allow overriding via environment variable so sweep scripts can
+    # write separate logs per run.
+    log_path = os.environ.get('MM_THROUGHPUT_LOG', 'mm_throughput.log')
     cumulative_bytes = 0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((ip, port))
@@ -528,11 +544,20 @@ def main():
     parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
 
     parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
+    parser.add_argument("--fixed_cwnd_packets", type=float, default=None, help="If set, override congestion control and use a fixed cwnd (in packets) for the sender")
     args = parser.parse_args()
 
     if args.role == "receiver":
         start_receiver(args.ip, args.port)
     else:
+        # If the user provided a fixed cwnd, set the module-level variable.
+        global FIXED_CWND_PACKETS
+        if args.fixed_cwnd_packets is not None:
+            try:
+                FIXED_CWND_PACKETS = float(args.fixed_cwnd_packets)
+            except Exception:
+                FIXED_CWND_PACKETS = None
+
         if args.sendfile is None:
             print("No file to send")
             return
