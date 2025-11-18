@@ -70,6 +70,12 @@ def main():
     parser.add_argument('--out_dir', type=str, default='sweep_logs', help='Directory for logs/outputs')
     parser.add_argument('--run_cmd', type=str, default='python3 run_experiments.py',
                         help='Command to run the experiment (should accept the same flags).')
+    parser.add_argument('--external_receiver', action='store_true',
+                        help='Assume receiver is already running in another terminal and writing an mm_throughput log')
+    parser.add_argument('--mm_log', type=str, default='mm_throughput.log',
+                        help='Path to the mm_throughput log file the receiver writes (used with --external_receiver)')
+    parser.add_argument('--receiver_ip', type=str, default='127.0.0.1', help='IP address where receiver is listening')
+    parser.add_argument('--receiver_port', type=int, default=9000, help='Port where receiver is listening')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -81,32 +87,45 @@ def main():
     print(f"BDP ~ {bdp_bytes:.1f} bytes = {bdp_packets} packets; sweeping 1..{max_packets}")
 
     results = []
-    # Use transport.py directly: start receiver (writes mm log) then run sender with fixed cwnd
-    parser_ip = '127.0.0.1'
-    parser_port = 9000
+    # Use transport.py directly: either start receiver (internal mode) or assume receiver is external.
+    parser_ip = args.receiver_ip
+    parser_port = args.receiver_port
     for cwnd_p in range(1, max_packets + 1):
-        log_path = os.path.join(args.out_dir, f"mm_throughput_{cwnd_p}.log")
-        # Ensure old log removed
+        # For internal mode we create a per-run log file and start the receiver writing to it.
+        # For external_receiver mode we read the provided mm_log path and diff before/after.
+        log_path = os.path.join(args.out_dir, f"mm_throughput_{cwnd_p}.log") if not args.external_receiver else args.mm_log
+        # Ensure old log removed for internal mode
         try:
-            if os.path.exists(log_path):
+            if not args.external_receiver and os.path.exists(log_path):
                 os.remove(log_path)
         except Exception:
             pass
 
         env = os.environ.copy()
-        env['MM_THROUGHPUT_LOG'] = log_path
+        # Internal mode: start receiver writing to a per-run log file
+        recv_proc = None
+        if not args.external_receiver:
+            env['MM_THROUGHPUT_LOG'] = log_path
+            recv_cmd = [sys.executable, 'transport.py', 'receiver', '--ip', parser_ip, '--port', str(parser_port)]
+            print(f"Starting receiver -> {' '.join(recv_cmd)} (log -> {log_path})")
+            try:
+                recv_proc = subprocess.Popen(recv_cmd, env=env)
+            except Exception as e:
+                print(f"Failed to start receiver: {e}")
+                break
 
-        # Start receiver as a separate process which will write the mm log
-        recv_cmd = [sys.executable, 'transport.py', 'receiver', '--ip', parser_ip, '--port', str(parser_port)]
-        print(f"Starting receiver -> {' '.join(recv_cmd)} (log -> {log_path})")
-        try:
-            recv_proc = subprocess.Popen(recv_cmd, env=env)
-        except Exception as e:
-            print(f"Failed to start receiver: {e}")
-            break
+            # Give receiver a moment to bind
+            time.sleep(0.2)
 
-        # Give receiver a moment to bind
-        time.sleep(0.2)
+        # For external_receiver mode, parse baseline (last line) from the existing mm log
+        baseline_t = None
+        baseline_b = 0
+        if args.external_receiver:
+            base_parsed = parse_mm_log(log_path)
+            if base_parsed is not None:
+                base_times, base_bytes = base_parsed
+                baseline_t = base_times[-1]
+                baseline_b = base_bytes[-1]
 
         # Run sender in the foreground; it will connect to the receiver and exit when done
         send_cmd = [sys.executable, 'transport.py', 'sender', '--ip', parser_ip, '--port', str(parser_port), '--sendfile', args.sendfile, '--simloss', str(args.simloss), '--fixed_cwnd_packets', str(cwnd_p)]
@@ -117,32 +136,51 @@ def main():
                 print(f"Sender failed for cwnd={cwnd_p} (exit {ret.returncode}).")
         except KeyboardInterrupt:
             print('Interrupted by user')
-            # Try to clean up receiver
-            try:
-                recv_proc.terminate()
-            except Exception:
-                pass
+            if recv_proc:
+                try:
+                    recv_proc.terminate()
+                except Exception:
+                    pass
             break
 
-        # Wait for receiver to exit (it should exit after receiving fin). Give it a short timeout
-        try:
-            recv_proc.wait(timeout=3.0)
-        except subprocess.TimeoutExpired:
-            # If receiver didn't exit, terminate it
+        # If we started the receiver, wait a short while for it to finish and flush
+        if recv_proc:
             try:
-                recv_proc.terminate()
-            except Exception:
-                pass
+                recv_proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    recv_proc.terminate()
+                except Exception:
+                    pass
 
         # Wait briefly for receiver to flush logfile
         time.sleep(0.1)
 
+        # Parse mm log and compute throughput. For external_receiver mode, compute delta from baseline.
         parsed = parse_mm_log(log_path)
         if parsed is None:
             print(f"No log produced for cwnd={cwnd_p} at {log_path}")
             continue
         times, bytes_vals = parsed
-        mbps, unique_bytes = compute_throughput(times, bytes_vals)
+        if args.external_receiver and baseline_t is not None:
+            # find the first index after baseline_t
+            start_idx = 0
+            for i, t in enumerate(times):
+                if t > baseline_t or (t == baseline_t and bytes_vals[i] > baseline_b):
+                    start_idx = i
+                    break
+            # Use baseline values as the starting sample
+            start_time = baseline_t
+            start_bytes = baseline_b
+            end_time = times[-1]
+            end_bytes = bytes_vals[-1]
+            dt = end_time - start_time
+            dbytes = end_bytes - start_bytes
+            mbps = (dbytes * 8.0) / dt / 1e6 if dt > 0 else 0.0
+            unique_bytes = dbytes
+        else:
+            mbps, unique_bytes = compute_throughput(times, bytes_vals)
+
         print(f"cwnd={cwnd_p} pkts -> {mbps:.3f} Mbps over {len(times)} samples ({unique_bytes} unique bytes)")
         results.append((cwnd_p, mbps, unique_bytes))
 
@@ -162,7 +200,7 @@ def main():
         ys = [r[1] for r in results]
         plt.figure(figsize=(8,4))
         plt.plot(xs, ys, marker='o')
-        plt.xlabel('cwnd (packets)')
+        plt.xlabel('cwnd (packets) x BDP')
         plt.ylabel('Goodput (Mbps)')
         plt.title(f'Goodput vs cwnd (link {args.link_rate_mbps} Mbps, delay {args.base_delay_ms} ms)')
         plt.grid(True)
