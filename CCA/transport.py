@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import random
 import socket
 import time
+import os
 
 # Note: In this starter code, we annotate types where
 # appropriate. While it is optional, both in python and for this
@@ -21,6 +22,9 @@ class Receiver:
         self.received_ranges = []
         self.rcv_buffer = {} # seq_num_start -> ending seq_num, data
         self.next_seq = 0
+        # timestamps for computing goodput
+        self.start_time = None
+        self.end_time = None
 
     def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[List[Tuple[int, int]], str]:
         '''This function is called whenever a data packet is
@@ -50,6 +54,10 @@ class Receiver:
 
         '''
         # TODO
+        # mark start time when we receive first data packet
+        if self.start_time is None:
+            self.start_time = time.time()
+
         self.received_ranges = self.merge_range(self.received_ranges, seq_range)
         data_for_app = ""
         if seq_range[0] == self.next_seq:
@@ -108,15 +116,32 @@ class Receiver:
 
         '''
         # TODO
+        # mark end time
+        self.end_time = time.time()
+
         if self.rcv_buffer:
             print("RCV Buffer NOT Empty when finish() was called!")
             print("Buffer contents:", list(self.rcv_buffer.keys()))
         else:
             print("RCV Buffer Empty when finish() was called")
 
+    def total_unique_bytes(self) -> int:
+        """Return the total number of unique bytes received (sum of merged ranges)."""
+        total = 0
+        for a, b in self.received_ranges:
+            total += max(0, b - a)
+        return total
+
+    def duration(self) -> float:
+        if self.start_time is None:
+            return 0.0
+        if self.end_time is None:
+            return time.time() - self.start_time
+        return max(1e-6, self.end_time - self.start_time)
+
 
 class Sender:
-    def __init__(self, data_len: int):
+    def __init__(self, data_len: int, fixed_cwnd_pkts: Optional[int] = None):
         '''`data_len` is the length of the data we want to send. A real
         solution will not force the application to pre-commit to the
         length of data, but we are ok with it.'''
@@ -135,6 +160,8 @@ class Sender:
         # Congestion window (bytes) for AIMD. Start with 1 packet (slow-start would also start low).
         # Keep as float for fractional additive increments; get_cwnd() will return an int.
         self.cwnd = float(payload_size)
+        # If fixed_cwnd_pkts is provided, override congestion control and return a constant cwnd
+        self.fixed_cwnd_pkts = fixed_cwnd_pkts
 
     def timeout(self):
         '''Called when the sender times out.'''
@@ -245,6 +272,10 @@ class Sender:
 
     def get_cwnd(self) -> int:
         # Return current congestion window in bytes (int).
+        if getattr(self, 'fixed_cwnd_pkts', None) is not None:
+            # fixed cwnd in packets -> convert to bytes
+            val = int(self.fixed_cwnd_pkts) * payload_size
+            return int(max(payload_size, val))
         return int(max(payload_size, int(self.cwnd)))
     
     def get_rto(self) -> float:
@@ -338,7 +369,7 @@ class Sender:
         return len(self.acked_intervals) == 1 and self.acked_intervals[0][0] == 0 and self.acked_intervals[0][1] >= self.data_len
 
 
-def start_receiver(ip: str, port: int):
+def start_receiver(ip: str, port: int, logfile: Optional[str] = None):
     '''Starts a receiver thread. For each source address, we start a new
     `Receiver` class. When a `fin` packet is received, we call the
     `finish` function of that class.
@@ -417,23 +448,41 @@ def start_receiver(ip: str, port: int):
                 server_socket.sendto(json.dumps({"type": "ack", "sacks": sacks, "id": received["id"]}).encode(), addr)
             elif received["type"] == "fin":
                 receivers[addr].finish()
-                # P3 code
-                # receivers[addr][0].finish()
-                # # Check if the file is received and send fin-ack
-                # if received_data:
-                #     print("received data (summary): ", received_data[:100], "...", len(received_data))
-                #     # print("received file is saved into: ", receivers[addr][1].name)
-                #     server_socket.sendto(json.dumps({"type": "fin"}).encode(), addr)
-                #     received_data = ''
+                # compute goodput (unique bytes / duration)
+                rcv = receivers[addr]
+                total = rcv.total_unique_bytes()
+                duration = rcv.duration()
+                goodput_bps = float(total) / duration if duration > 0 else 0.0
+                print(f"Receiver finished: total_unique_bytes={total}, duration={duration:.6f}s, goodput={goodput_bps:.2f} B/s")
+                if logfile:
+                    try:
+                        cwnd_val = None
+                        try:
+                            cwnd_val = int(received.get('cwnd_pkts')) if isinstance(received, dict) and 'cwnd_pkts' in received else None
+                        except Exception:
+                            cwnd_val = None
+                        with open(logfile, 'a') as lf:
+                            entry = {
+                                "addr": f"{addr[0]}:{addr[1]}",
+                                "total_bytes": total,
+                                "duration_s": duration,
+                                "goodput_Bps": goodput_bps
+                            }
+                            if cwnd_val is not None:
+                                entry['cwnd_pkts'] = cwnd_val
+                            lf.write(json.dumps(entry) + "\n")
+                    except Exception as e:
+                        print("Failed to write logfile:", e)
 
-                # del receivers[addr]
+                # remove receiver state
+                del receivers[addr]
 
             else:
                 assert False
 
 
-def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float):
-    sender = Sender(len(data))
+def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float, fixed_cwnd_pkts: Optional[int] = None):
+    sender = Sender(len(data), fixed_cwnd_pkts)
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
         # So we can receive messages
@@ -467,29 +516,16 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         for p in send_buf:
                             client_socket.send(p)
                         send_buf = []
-                    client_socket.send('{"type": "fin"}'.encode())
+                    # send a FIN packet and include the fixed cwnd (packets) if present
+                    try:
+                        fin_msg = {"type": "fin"}
+                        if getattr(sender, 'fixed_cwnd_pkts', None) is not None:
+                            fin_msg["cwnd_pkts"] = int(sender.fixed_cwnd_pkts)
+                        client_socket.send(json.dumps(fin_msg).encode())
+                    except Exception:
+                        # fallback to simple fin
+                        client_socket.send('{"type": "fin"}'.encode())
                     break
-                    # p3 code
-                    # try:
-                    #     print("======= Final Waiting =======")
-                    #     received = client_socket.recv(65535)
-                    #     received = json.loads(received.decode())
-                    #     if received["type"] == "ack":
-                    #         client_socket.send('{"type": "fin"}'.encode())
-                    #         continue
-                    #     elif received["type"] == "fin":
-                    #         print(f"Got FIN-ACK")
-                    #         got_fin_ack = True
-                    #         break
-                    # except socket.timeout:
-                    #     inflight = 0
-                    #     print("Timeout")
-                    #     sender.timeout()
-                    #     exit(1)
-                    # if got_fin_ack:
-                    #     break
-                    # else:
-                    #     continue
 
                 elif seq[1] == seq[0]:
                     # No more packets to send until loss happens. Wait
@@ -502,10 +538,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
 
                 # Simulate random loss before sending packets
                 if random.random() < simloss:
-                    # print("Dropped!") # from P3 code
                     pass
                 else:
-                    # Send the packet
                     client_socket.send(
                         json.dumps(
                             {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
@@ -513,21 +547,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     )
                     # record the actual send time for RTT measurement
                     sender.record_send_time(packet_id)
-                    # our P3 code
-                    # pkt_str = json.dumps(
-                    #     {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
-                    # ).encode()
-                    # # pkts_to_reorder is a variable that bounds the maximum amount of reordering. To disable reordering, set to 1
-                    # if len(send_buf) < pkts_to_reorder:
-                    #     send_buf += [pkt_str]
-
-                    # if len(send_buf) == pkts_to_reorder:
-                    #     # Randomly shuffle send_buf
-                    #     random.shuffle(send_buf)
-
-                    #     for p in send_buf:
-                    #         client_socket.send(p)
-                    #     send_buf = []
 
                 inflight += seq[1] - seq[0]
                 packet_id += 1
@@ -565,10 +584,12 @@ def main():
     parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
 
     parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
+    parser.add_argument("--fixed-cwnd-pkts", type=int, default=None, help="(sender) Force a constant congestion window given in packets")
+    parser.add_argument("--logfile", type=str, default=None, help="(receiver) Path to append goodput summary JSON lines")
     args = parser.parse_args()
 
     if args.role == "receiver":
-        start_receiver(args.ip, args.port)
+        start_receiver(args.ip, args.port, args.logfile)
     else:
         if args.sendfile is None:
             print("No file to send")
@@ -576,7 +597,7 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
-            start_sender(args.ip, args.port, data, args.recv_window, args.simloss)
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss, args.fixed_cwnd_pkts)
 
 
 if __name__ == "__main__":
