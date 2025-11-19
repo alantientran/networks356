@@ -1,0 +1,11 @@
+{"addr": "127.0.0.1:50509", "total_bytes": 1003229, "duration_s": 0.10425496101379395, "goodput_Bps": 9622841.831644472, "cwnd_pkts": 1}
+{"addr": "127.0.0.1:52952", "total_bytes": 1003229, "duration_s": 0.05450296401977539, "goodput_Bps": 18406870.489392042, "cwnd_pkts": 25}
+{"addr": "127.0.0.1:49743", "total_bytes": 1003229, "duration_s": 0.06447982788085938, "goodput_Bps": 15558803.938709104, "cwnd_pkts": 50}
+{"addr": "127.0.0.1:50927", "total_bytes": 1003229, "duration_s": 0.05281519889831543, "goodput_Bps": 18995081.357764207, "cwnd_pkts": 75}
+{"addr": "127.0.0.1:62603", "total_bytes": 1003229, "duration_s": 0.05597400665283203, "goodput_Bps": 17923122.89206549, "cwnd_pkts": 100}
+{"addr": "127.0.0.1:54163", "total_bytes": 1003229, "duration_s": 0.05584120750427246, "goodput_Bps": 17965746.88903785, "cwnd_pkts": 125}
+{"addr": "127.0.0.1:52285", "total_bytes": 1003229, "duration_s": 0.06013011932373047, "goodput_Bps": 16684300.834308734, "cwnd_pkts": 150}
+{"addr": "127.0.0.1:52944", "total_bytes": 1003229, "duration_s": 0.059345245361328125, "goodput_Bps": 16904960.016455613, "cwnd_pkts": 175}
+{"addr": "127.0.0.1:55956", "total_bytes": 1003229, "duration_s": 0.06283116340637207, "goodput_Bps": 15967060.700618139, "cwnd_pkts": 200}
+{"addr": "127.0.0.1:49971", "total_bytes": 1003229, "duration_s": 0.0632328987121582, "goodput_Bps": 15865617.746970417, "cwnd_pkts": 225}
+{"addr": "127.0.0.1:55650", "total_bytes": 1003229, "duration_s": 0.06520891189575195, "goodput_Bps": 15384844.967262143, "cwnd_pkts": 250}
